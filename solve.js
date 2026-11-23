@@ -13,6 +13,18 @@ function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
+/** Per-run cache of escaped strings, for template {{ }} values: the same titles, urls and tag names are escaped on many renders, so the escape is paid once per distinct value. */
+let escCache = new Map();
+
+/** escapeHtml with a per-run cache (used only for template values; inline() keeps the uncached escapeHtml, whose plain runs are mostly unique slices). */
+function escapeCached(text) {
+  const hit = escCache.get(text);
+  if (hit !== undefined) return hit;
+  const out = escapeHtml(text);
+  escCache.set(text, out);
+  return out;
+}
+
 const SLUG_MAX = 64;
 
 /** Per-run slug cache; replaced by run() for every case. */
@@ -27,14 +39,31 @@ let slugCache = new Map();
  * replace does exactly that (the NFKD step already ran for non-ASCII, so a
  * lowercasing that could add a combining mark cannot happen here).
  */
+/** The dashed form of a lowercased string: a-z0-9 kept (A-Z lowered inline), every other run one '-', no leading or trailing '-', cut to 64 chars before the trailing '-' is stripped — exactly the regex chain's result, in one scan. */
+function dashed(text) {
+  let out = '';
+  let dash = true;
+  for (let i = 0; i < text.length; i++) {
+    let c = text.charCodeAt(i);
+    if (c >= 65 && c <= 90) c += 32;
+    if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) { out += String.fromCharCode(c); dash = false; }
+    else if (!dash) { out += '-'; dash = true; }
+  }
+  if (out.length > SLUG_MAX) out = out.slice(0, SLUG_MAX);
+  let end = out.length;
+  while (end > 0 && out[end - 1] === '-') end--;
+  return out.slice(0, end);
+}
+
 function slugify(text) {
   const hit = slugCache.get(text);
   if (hit !== undefined) return hit;
-  const plain = /[^\x00-\x7F]/.test(text) ? text.normalize('NFKD').replace(/\p{M}/gu, '') : text;
-  let out = plain.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '').slice(0, SLUG_MAX).replace(/-+$/, '');
-  if (out === '') out = 'untitled';
-  slugCache.set(text, out);
-  return out;
+  // Non-ASCII goes the reference route first (NFKD, strip marks, lowercase),
+  // then the same single scan; pure ASCII skips the (slow) normalise step.
+  const out = /[^\x00-\x7F]/.test(text) ? dashed(text.normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase()) : dashed(text);
+  const slug = out === '' ? 'untitled' : out;
+  slugCache.set(text, slug);
+  return slug;
 }
 
 /** `slug` made unique against `taken` (and added to it). */
@@ -52,18 +81,21 @@ function longDate(date) {
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
-/** The words of a body: runs of characters other than whitespace (counted, not listed). The manual scan beats match(/\S+/g) (28.6ms) and the exec loop (33.0ms) on the practice bodies (23.3ms): no array is built. */
+/** The words of a body: runs of characters other than whitespace (counted, not listed). Fast paths for the common ASCII bytes (space, LF, letters) keep the per-character cost to two or three comparisons; the full Unicode whitespace set is only consulted for non-ASCII bytes. */
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
     const c = text.charCodeAt(i);
-    const ws = c === 32 || (c >= 9 && c <= 13) || c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
-    if (ws) inWord = false;
-    else if (!inWord) {
-      inWord = true;
-      n++;
+    if (c === 32 || c === 10) { inWord = false; continue; }
+    if (c < 128) {
+      if (c === 9 || c === 11 || c === 12 || c === 13) { inWord = false; continue; }
+      if (!inWord) { inWord = true; n++; }
+      continue;
     }
+    const ws = c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+    if (ws) inWord = false;
+    else if (!inWord) { inWord = true; n++; }
   }
   return n;
 }
@@ -265,9 +297,30 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- Markdown
 
-const BULLET = /^[-*] (.*)$/;
-const ORDERED = /^(\d{1,9})\. (.*)$/;
-const CONTINUED = /^ {2,}\S/;
+/** A bullet line's item text, or null: '-' or '*' plus one space (the /^[-*] (.*)$/ test, by hand). */
+function bulletOf(line) {
+  if ((line[0] === '-' || line[0] === '*') && line[1] === ' ') return line.slice(2);
+  return null;
+}
+
+/** An ordered line's [number, text], or null: 1-9 digits, '. ', then text (the /^(\d{1,9})\. (.*)$/ test, by hand). */
+function orderedOf(line) {
+  let d = 0;
+  while (d < 9 && line.charCodeAt(d) >= 48 && line.charCodeAt(d) <= 57) d++;
+  if (d === 0) return null;
+  if (d === 9 && line.charCodeAt(9) >= 48 && line.charCodeAt(9) <= 57) return null;
+  if (line[d] !== '.' || line[d + 1] !== ' ') return null;
+  return [line.slice(0, d), line.slice(d + 2)];
+}
+
+/** Whether `line` continues a list item: 2+ spaces, then a non-whitespace character (the /^ {2,}\S/ test, by hand). */
+function isContinued(line) {
+  let i = 0;
+  while (line[i] === ' ') i++;
+  if (i < 2 || i >= line.length) return false;
+  const c = line.charCodeAt(i);
+  return !(c === 32 || (c >= 9 && c <= 13) || c === 0x00a0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff);
+}
 
 /** Whether `line` holds only spaces and tabs (or is empty). */
 function isBlank(line) {
@@ -518,22 +571,28 @@ function renderMarkdown(src, env) {
       blocks.push(qlines.length === 0 ? '<blockquote>\n</blockquote>' : `<blockquote>\n<p>${inline(qlines.join('\n'), env)}</p>\n</blockquote>`);
       continue;
     }
-    let bullet = null;
-    let ordered = null;
-    if (line[0] === '-' || line[0] === '*') bullet = BULLET.exec(line);
-    if (bullet === null && line[0] >= '0' && line[0] <= '9') ordered = ORDERED.exec(line);
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const startNum = isOrdered ? Number(ordered[1]) : 1;
-      const marker = isOrdered ? ORDERED : BULLET;
+    let bulletText = null;
+    let orderedPair = null;
+    if (line[0] === '-' || line[0] === '*') bulletText = bulletOf(line);
+    if (bulletText === null && line[0] >= '0' && line[0] <= '9') orderedPair = orderedOf(line);
+    if (bulletText !== null || orderedPair !== null) {
+      const isOrdered = orderedPair !== null;
+      const startNum = isOrdered ? Number(orderedPair[0]) : 1;
       const items = [];
       while (i < n) {
-        const m = marker.exec(lines[i]);
-        if (m !== null) {
-          items.push([trimLine(isOrdered ? m[2] : m[1])]);
+        const ln = lines[i];
+        let text = null;
+        if (isOrdered) {
+          if (ln[0] >= '0' && ln[0] <= '9') {
+            const o = orderedOf(ln);
+            if (o !== null) text = o[1];
+          }
+        } else if (ln[0] === '-' || ln[0] === '*') text = bulletOf(ln);
+        if (text !== null) {
+          items.push([trimLine(text)]);
           i++;
-        } else if (lines[i][0] === ' ' && lines[i][1] === ' ' && CONTINUED.test(lines[i])) {
-          items[items.length - 1].push(trimLine(lines[i]));
+        } else if (ln[0] === ' ' && ln[1] === ' ' && isContinued(ln)) {
+          items[items.length - 1].push(trimLine(ln));
           i++;
         } else break;
       }
@@ -657,6 +716,66 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
+/**
+ * Whether rendering `nodes` depends only on the loop variable(s) in `allowed`
+ * (plus the innermost `loop`, when `loopOk`): every var/if path's first segment
+ * is allowed, every nested for's iterable is allowed, and every include's
+ * template is likewise pure. Include cycles are impure (conservative). A pure
+ * for-body renders the same fragment for the same item wherever it is rendered,
+ * so it can be memoised per item.
+ */
+function refsPure(nodes, allowed, loopOk, templates, stack) {
+  for (const n of nodes) {
+    switch (n.kind) {
+      case 'text':
+        break;
+      case 'var':
+      case 'raw':
+        if (!allowed.has(n.path[0]) && !(loopOk && n.path[0] === 'loop')) return false;
+        break;
+      case 'if':
+        if (!allowed.has(n.path[0]) && !(loopOk && n.path[0] === 'loop')) return false;
+        if (!refsPure(n.then, allowed, loopOk, templates, stack)) return false;
+        if (n.else !== null && !refsPure(n.else, allowed, loopOk, templates, stack)) return false;
+        break;
+      case 'for': {
+        if (!allowed.has(n.path[0])) return false;
+        const inner = new Set(allowed);
+        inner.add(n.name);
+        if (!refsPure(n.body, inner, true, templates, stack)) return false;
+        break;
+      }
+      case 'include': {
+        const t = templates.get(n.name);
+        if (t === undefined) break;
+        if (stack.has(n.name)) return false;
+        stack.add(n.name);
+        const ok = refsPure(t, allowed, loopOk, templates, stack);
+        stack.delete(n.name);
+        if (!ok) return false;
+        break;
+      }
+    }
+  }
+  return true;
+}
+
+/** Mark every for-node in every template with `pure` (see refsPure). */
+function markForPure(templates) {
+  const walk = (nodes) => {
+    for (const n of nodes) {
+      if (n.kind === 'for') {
+        n.pure = refsPure(n.body, new Set([n.name]), false, templates, new Set());
+        walk(n.body);
+      } else if (n.kind === 'if') {
+        walk(n.then);
+        if (n.else !== null) walk(n.else);
+      }
+    }
+  };
+  for (const nodes of templates.values()) walk(nodes);
+}
+
 /** The value at `path` in the scope chain: its first name from the nearest scope holding it, then own properties. */
 const hasOwn = Object.hasOwn;
 function lookup(scope, path) {
@@ -719,17 +838,46 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         if (!Array.isArray(xs)) break;
         // One scope object per loop, mutated per item: rendering is synchronous,
         // so nothing can observe the previous item's bindings. `loop` still wins
-        // over the element when the loop variable is itself named `loop`.
+        // over the element when the loop variable is itself named `loop`, so the
+        // per-item overwrite of vars.loop only runs in that case.
         const loop = { index: 0, first: false, last: false, length: xs.length };
         const vars = { loop };
         const child = { vars, parent: scope };
-        for (let k = 0; k < xs.length; k++) {
-          vars[n.name] = xs[k];
-          vars.loop = loop;
-          loop.index = k + 1;
-          loop.first = k === 0;
-          loop.last = k === xs.length - 1;
-          renderNodes(n.body, child, ctx, depth, out);
+        const namedLoop = n.name === 'loop';
+        if (n.pure === true) {
+          // Fragment memoisation: a pure body depends only on the item (and the
+          // include depth, which caps includes), so the same item renders the
+          // same fragment wherever the loop runs — the card include on the index
+          // page and on every tag page, for instance.
+          let perNode = ctx.fragCache.get(n);
+          if (perNode === undefined) { perNode = new Map(); ctx.fragCache.set(n, perNode); }
+          for (let k = 0; k < xs.length; k++) {
+            const item = xs[k];
+            let arr = perNode.get(item);
+            let frag = arr === undefined ? undefined : arr[depth];
+            if (frag === undefined) {
+              vars[n.name] = item;
+              if (namedLoop) vars.loop = loop;
+              loop.index = k + 1;
+              loop.first = k === 0;
+              loop.last = k === xs.length - 1;
+              const tmp = [];
+              renderNodes(n.body, child, ctx, depth, tmp);
+              frag = tmp.join('');
+              if (arr === undefined) { arr = []; perNode.set(item, arr); }
+              arr[depth] = frag;
+            }
+            out.push(frag);
+          }
+        } else {
+          for (let k = 0; k < xs.length; k++) {
+            vars[n.name] = xs[k];
+            if (namedLoop) vars.loop = loop;
+            loop.index = k + 1;
+            loop.first = k === 0;
+            loop.last = k === xs.length - 1;
+            renderNodes(n.body, child, ctx, depth, out);
+          }
         }
         break;
       }
@@ -911,13 +1059,21 @@ function cardOf(s) {
   return card;
 }
 
-/** A page as its layout reads it. */
+/** A page as its layout reads it. Built field by field (no spread of the card, and the toc array is shared: templates only read it, never write it, so the copy the reference builds is unobservable). */
 function pageOf(s) {
+  const card = cardOf(s);
   return {
-    ...cardOf(s),
+    title: card.title,
+    url: card.url,
+    date: card.date,
+    date_long: card.date_long,
+    summary: card.summary,
+    excerpt: card.excerpt,
+    reading_minutes: card.reading_minutes,
+    tags: card.tags,
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
@@ -934,7 +1090,7 @@ function layouts(b) {
   // being spread into a fresh object per render (render vars are page, posts,
   // pager and tag, never site, tags or recent, so nothing is shadowed).
   const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
-  const ctx = { templates: b.templates, escape: escapeHtml };
+  const ctx = { templates: b.templates, escape: escapeCached, fragCache: new Map() };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
     if (nodes === undefined) return null;
@@ -988,6 +1144,7 @@ function build(input) {
       reportLines.push(err.message);
     }
   }
+  markForPure(templates);
   const b = {
     input,
     base: input.site.base_url.replace(/\/+$/, ''),
@@ -1009,5 +1166,6 @@ function build(input) {
 /** makefun-site 1.0.0's answer for one case's input. */
 export function run(input) {
   slugCache = new Map();
+  escCache = new Map();
   return build(input);
 }
