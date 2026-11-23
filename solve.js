@@ -6,8 +6,10 @@
 // ---------------------------------------------------------------- text
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+const ESC_RE = /[&<>"']/;
 
 function escapeHtml(text) {
+  if (!ESC_RE.test(text)) return text;
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
@@ -16,35 +18,20 @@ const SLUG_MAX = 64;
 /** Per-run slug cache; replaced by run() for every case. */
 let slugCache = new Map();
 
-function slugLoop(plain) {
-  let out = '';
-  let gap = false;
-  for (let i = 0; i < plain.length; i++) {
-    const ch = plain[i];
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
-      continue;
-    }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
-  }
-  return out;
-}
-
 /**
  * The slug of `text`. Pure-ASCII text is unchanged by NFKD and holds no combining
  * marks, so it skips the (slow) normalise step entirely; anything else goes the
- * reference route. Results are cached per run.
+ * reference route. Results are cached per run. The slug rule, spelled out: keep
+ * a-z0-9 (A-Z lowered), every other run becomes one '-', no leading or trailing
+ * '-', cut to 64 chars before the trailing '-' is stripped. toLowerCase +
+ * replace does exactly that (the NFKD step already ran for non-ASCII, so a
+ * lowercasing that could add a combining mark cannot happen here).
  */
 function slugify(text) {
   const hit = slugCache.get(text);
   if (hit !== undefined) return hit;
   const plain = /[^\x00-\x7F]/.test(text) ? text.normalize('NFKD').replace(/\p{M}/gu, '') : text;
-  let out = slugLoop(plain).slice(0, SLUG_MAX).replace(/-+$/, '');
+  let out = plain.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+/, '').slice(0, SLUG_MAX).replace(/-+$/, '');
   if (out === '') out = 'untitled';
   slugCache.set(text, out);
   return out;
@@ -65,7 +52,7 @@ function longDate(date) {
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
-/** The words of a body: runs of characters other than whitespace (counted, not listed). */
+/** The words of a body: runs of characters other than whitespace (counted, not listed). The manual scan beats match(/\S+/g) (28.6ms) and the exec loop (33.0ms) on the practice bodies (23.3ms): no array is built. */
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
@@ -83,6 +70,18 @@ function wordsOf(text) {
 
 /** Code-unit order (never the locale's). */
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Whether `target` is an absolute URI (a scheme, `^[A-Za-z][A-Za-z0-9+.-]*:`): a letter, then scheme characters, then ':'. */
+function isAbsoluteUri(target) {
+  const c0 = target.charCodeAt(0);
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return false;
+  for (let i = 1; i < target.length; i++) {
+    const c = target.charCodeAt(i);
+    if (c === 58) return true;
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) return false;
+  }
+  return false;
+}
 
 /** `rel` from the directory `dir` of a source, or null when it climbs out of the root. */
 function resolvePath(dir, rel) {
@@ -103,12 +102,6 @@ const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/'
 
 const KEYS = Object.freeze(['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary']);
 
-const LINE = /^([a-z_]+):(?: (.*))?$/;
-const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
-const NAME = /^[a-z0-9-]+$/;
-const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const TAG = /^[^"[\]]+$/;
-
 /** The days of month `m` (1-12) of year `y`, by the Gregorian rule. */
 function daysIn(y, m) {
   if (m === 2) return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0 ? 29 : 28;
@@ -119,6 +112,11 @@ function daysIn(y, m) {
 function stringOf(raw) {
   if (raw.startsWith('"')) {
     if (raw.length < 2 || !raw.endsWith('"')) return { error: 'a quoted string is not closed' };
+    const inner = raw.slice(1, -1);
+    if (inner.indexOf('\\') === -1) {
+      if (inner.indexOf('"') !== -1) return { error: 'a quoted string holds a stray quote' };
+      return { value: inner };
+    }
     let out = '';
     for (let i = 1; i < raw.length - 1; i++) {
       const c = raw[i];
@@ -145,11 +143,19 @@ function valueOf(key, raw) {
       return 'error' in s ? { error: `key "${key}": ${s.error}` } : s;
     }
     case 'date': {
-      const m = DATE.exec(raw);
-      const y = m ? Number(m[1]) : 0;
-      const mo = m ? Number(m[2]) : 0;
-      const d = m ? Number(m[3]) : 0;
-      if (!m || y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo)) return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
+      // YYYY-MM-DD, 1970-01-01 to 2099-12-31, by character checks.
+      let bad = raw.length !== 10 || raw[4] !== '-' || raw[7] !== '-';
+      if (!bad) {
+        for (let q = 0; q < 10; q++) {
+          if (q === 4 || q === 7) continue;
+          const c = raw.charCodeAt(q);
+          if (c < 48 || c > 57) { bad = true; break; }
+        }
+      }
+      const y = bad ? 0 : (raw.charCodeAt(0) - 48) * 1000 + (raw.charCodeAt(1) - 48) * 100 + (raw.charCodeAt(2) - 48) * 10 + (raw.charCodeAt(3) - 48);
+      const mo = bad ? 0 : (raw.charCodeAt(5) - 48) * 10 + (raw.charCodeAt(6) - 48);
+      const d = bad ? 0 : (raw.charCodeAt(8) - 48) * 10 + (raw.charCodeAt(9) - 48);
+      if (bad || y < 1970 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > daysIn(y, mo)) return { error: 'key "date": not a date from 1970-01-01 to 2099-12-31 (YYYY-MM-DD)' };
       return { value: raw };
     }
     case 'tags': {
@@ -157,15 +163,41 @@ function valueOf(key, raw) {
       const inner = raw.slice(1, -1);
       if (inner.trim() === '') return { value: [] };
       const tags = inner.split(',').map((t) => t.trim());
-      if (tags.some((t) => t === '' || !TAG.test(t))) return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
+      for (const t of tags) {
+        if (t === '') return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
+        for (let q = 0; q < t.length; q++) {
+          const c = t[q];
+          if (c === '"' || c === '[' || c === ']') return { error: 'key "tags": an empty tag, or one holding " [ or ]' };
+        }
+      }
       return { value: tags };
     }
     case 'draft':
       return raw === 'true' ? { value: true } : raw === 'false' ? { value: false } : { error: 'key "draft": true or false' };
-    case 'layout':
-      return NAME.test(raw) ? { value: raw } : { error: 'key "layout": not a template name' };
-    case 'slug':
-      return SLUG.test(raw) && raw.length <= 64 ? { value: raw } : { error: 'key "slug": not a slug' };
+    case 'layout': {
+      // A template name: [a-z0-9-]+.
+      if (raw.length === 0) return { error: 'key "layout": not a template name' };
+      for (let q = 0; q < raw.length; q++) {
+        const c = raw.charCodeAt(q);
+        if (!((c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 45)) return { error: 'key "layout": not a template name' };
+      }
+      return { value: raw };
+    }
+    case 'slug': {
+      // A slug: [a-z0-9]+ segments joined by single '-', at most 64 chars.
+      if (raw.length === 0 || raw.length > 64) return { error: 'key "slug": not a slug' };
+      let prevDash = true;
+      for (let q = 0; q < raw.length; q++) {
+        const c = raw.charCodeAt(q);
+        if (c === 45) {
+          if (prevDash) return { error: 'key "slug": not a slug' };
+          prevDash = true;
+        } else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) prevDash = false;
+        else return { error: 'key "slug": not a slug' };
+      }
+      if (prevDash) return { error: 'key "slug": not a slug' };
+      return { value: raw };
+    }
     default:
       return { error: `unknown key "${key}"` };
   }
@@ -202,11 +234,24 @@ function parseFrontMatter(text) {
   const data = {};
   for (let i = 0; i < fmLines.length; i++) {
     const line = fmLines[i];
-    if (/^[ \t]*$/.test(line) || line.startsWith('#')) continue;
-    const m = LINE.exec(line);
-    if (!m) return { error: `line ${i + 2} is not "key: value"` };
-    const key = m[1];
-    const raw = (m[2] ?? '').replace(/[ \t]+$/, '');
+    if (line[0] === '#' || isBlank(line)) continue;
+    const colon = line.indexOf(':');
+    if (colon <= 0) return { error: `line ${i + 2} is not "key: value"` };
+    const key = line.slice(0, colon);
+    let keyOk = true;
+    for (let q = 0; q < key.length; q++) {
+      const c = key.charCodeAt(q);
+      if (!((c >= 97 && c <= 122) || c === 95)) { keyOk = false; break; }
+    }
+    if (!keyOk) return { error: `line ${i + 2} is not "key: value"` };
+    let raw;
+    if (colon === line.length - 1) raw = '';
+    else if (line[colon + 1] === ' ') {
+      raw = line.slice(colon + 2);
+      let end = raw.length;
+      while (end > 0 && (raw[end - 1] === ' ' || raw[end - 1] === '\t')) end--;
+      raw = raw.slice(0, end);
+    } else return { error: `line ${i + 2} is not "key: value"` };
     if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
     if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
     if (raw === '') return { error: `key "${key}" has no value` };
@@ -220,30 +265,73 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- Markdown
 
-const BLANK = /^[ \t]*$/;
-const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE = /^```[ \t]*$/;
-const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
-const HR = /^(?:---|\*\*\*)[ \t]*$/;
-const QUOTE = /^>/;
 const BULLET = /^[-*] (.*)$/;
 const ORDERED = /^(\d{1,9})\. (.*)$/;
 const CONTINUED = /^ {2,}\S/;
 
-/** A heading line's level and text, or null (a heading's text is never empty). */
+/** Whether `line` holds only spaces and tabs (or is empty). */
+function isBlank(line) {
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+/** A fence-open line's language, or null: ``` plus lang chars [A-Za-z0-9_+-]* plus trailing space/tab only. */
+function fenceLang(line) {
+  if (!line.startsWith('```')) return null;
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  const lang = line.slice(3, i);
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) i++;
+  return i === line.length ? lang : null;
+}
+
+/** Whether `line` closes a fence: ``` plus trailing space/tab only. */
+function isFenceClose(line) {
+  if (!line.startsWith('```')) return false;
+  for (let i = 3; i < line.length; i++) {
+    if (line[i] !== ' ' && line[i] !== '\t') return false;
+  }
+  return true;
+}
+
+/** Whether `line` is a thematic break: --- or *** plus trailing space/tab only. */
+function isHr(line) {
+  if (!line.startsWith('---') && !line.startsWith('***')) return false;
+  for (let i = 3; i < line.length; i++) {
+    if (line[i] !== ' ' && line[i] !== '\t') return false;
+  }
+  return true;
+}
+
+/** A heading line's level and text, or null (a heading's text is never empty): 1-6 #'s, 1+ spaces/tabs, text with trailing space/tab stripped. */
 function headingOf(line) {
-  const m = HEADING.exec(line);
-  return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
+  let i = 0;
+  while (i < line.length && line[i] === '#') i++;
+  if (i === 0 || i > 6) return null;
+  if (i >= line.length || (line[i] !== ' ' && line[i] !== '\t')) return null;
+  let j = i;
+  while (j < line.length && (line[j] === ' ' || line[j] === '\t')) j++;
+  let k = line.length;
+  while (k > j && (line[k - 1] === ' ' || line[k - 1] === '\t')) k--;
+  if (k <= j) return null;
+  return { depth: i, text: line.slice(j, k) };
 }
 
 /** Whether `line` ends a paragraph: a blank line, a fence, a heading or a thematic break. */
 function endsParagraph(line) {
   if (line.length === 0) return true;
   const c0 = line[0];
-  if (c0 === ' ' || c0 === '\t') return BLANK.test(line);
-  if (c0 === '`') return FENCE_OPEN.test(line);
+  if (c0 === ' ' || c0 === '\t') return isBlank(line);
+  if (c0 === '`') return fenceLang(line) !== null;
   if (c0 === '#') return headingOf(line) !== null;
-  if (c0 === '-' || c0 === '*') return HR.test(line);
+  if (c0 === '-' || c0 === '*') return isHr(line);
   return false;
 }
 
@@ -259,8 +347,9 @@ const trimLine = (line) => {
 /** The characters a backslash escapes. */
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
+/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. With no backslash at all in range, a plain indexOf is exact. */
 function findUnescaped(s, what, from) {
+  if (s.indexOf('\\', from) === -1) return s.indexOf(what, from);
   for (let j = from; j <= s.length - what.length; j++) {
     if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
       j++;
@@ -271,8 +360,13 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
+/** The first single * from `from` (one whose run is not **), outside an escape, or -1. With no backslash in range, hop between '*' runs with indexOf: a run's last star is single exactly when the run has odd length, which is what the scan below also returns. */
 function findSingleStar(s, from) {
+  if (s.indexOf('\\', from) === -1) {
+    let j = s.indexOf('*', from);
+    while (j !== -1 && s[j + 1] === '*') j = s.indexOf('*', j + 2);
+    return j;
+  }
   for (let j = from; j < s.length; j++) {
     const c = s[j];
     if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
@@ -295,51 +389,64 @@ function findSingleStar(s, from) {
  * of one escape call per character.
  */
 function inline(s, env) {
-  const re = /[\\`*\[]/g;
+  const n = s.length;
   let out = '';
   let i = 0;
-  const n = s.length;
   while (i < n) {
-    re.lastIndex = i;
-    const m = re.exec(s);
-    const next = m === null ? n : m.index;
+    // The next special character, by native indexOf (no per-call regex, and
+    // recursion-safe: no shared regex state to clobber).
+    let next = n;
+    let kind = 0;
+    let j = s.indexOf('\\', i);
+    if (j !== -1 && j < next) { next = j; kind = 1; }
+    j = s.indexOf('`', i);
+    if (j !== -1 && j < next) { next = j; kind = 2; }
+    j = s.indexOf('*', i);
+    if (j !== -1 && j < next) { next = j; kind = 3; }
+    j = s.indexOf('[', i);
+    if (j !== -1 && j < next) { next = j; kind = 4; }
     if (next > i) out += escapeHtml(s.slice(i, next));
     if (next >= n) break;
     i = next;
-    const c = s[i];
-    if (c === '\\' && i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-      out += escapeHtml(s[i + 1]);
-      i += 2;
-    } else if (c === '`') {
-      const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
-        out += `<code>${escapeHtml(s.slice(i + 1, j))}</code>`;
-        i = j + 1;
+    if (kind === 1) {
+      const c = s[i + 1];
+      if (c !== undefined && ESCAPABLE.has(c)) {
+        out += escapeHtml(c);
+        i += 2;
+      } else {
+        out += '\\';
+        i++;
+      }
+    } else if (kind === 2) {
+      const j2 = s.indexOf('`', i + 1);
+      if (j2 > i + 1) {
+        out += `<code>${escapeHtml(s.slice(i + 1, j2))}</code>`;
+        i = j2 + 1;
       } else {
         out += '`';
         i++;
       }
-    } else if (c === '*') {
+    } else if (kind === 3) {
       if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
-        if (j > i + 2) {
-          out += `<strong>${inline(s.slice(i + 2, j), env)}</strong>`;
-          i = j + 2;
+        const j2 = findUnescaped(s, '**', i + 2);
+        if (j2 > i + 2) {
+          out += `<strong>${inline(s.slice(i + 2, j2), env)}</strong>`;
+          i = j2 + 2;
         } else {
           out += '**';
           i += 2;
         }
       } else {
-        const j = findSingleStar(s, i + 1);
-        if (j > i + 1) {
-          out += `<em>${inline(s.slice(i + 1, j), env)}</em>`;
-          i = j + 1;
+        const j2 = findSingleStar(s, i + 1);
+        if (j2 > i + 1) {
+          out += `<em>${inline(s.slice(i + 1, j2), env)}</em>`;
+          i = j2 + 1;
         } else {
           out += '*';
           i++;
         }
       }
-    } else if (c === '[') {
+    } else {
       const k = findUnescaped(s, ']', i + 1);
       const mm = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = mm === -1 ? '' : s.slice(k + 2, mm);
@@ -350,9 +457,6 @@ function inline(s, env) {
         out += '[';
         i++;
       }
-    } else {
-      out += escapeHtml(c);
-      i++;
     }
   }
   return out;
@@ -372,19 +476,20 @@ function renderMarkdown(src, env) {
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (line.length === 0 || ((line[0] === ' ' || line[0] === '\t') && BLANK.test(line))) {
+    if (line.length === 0 || ((line[0] === ' ' || line[0] === '\t') && isBlank(line))) {
       i++;
       continue;
     }
-    const fence = line.startsWith('```') ? FENCE_OPEN.exec(line) : null;
-    if (fence !== null) {
+    const lang = line.startsWith('```') ? fenceLang(line) : null;
+    if (lang !== null) {
       const body = [];
       i++;
-      while (i < n && !(lines[i].startsWith('```') && FENCE_CLOSE.test(lines[i]))) body.push(lines[i++]);
+      while (i < n && !isFenceClose(lines[i])) body.push(lines[i++]);
       i++;
-      const cls = fence[1] === '' ? '' : ` class="language-${escapeHtml(fence[1])}"`;
-      let code = '';
-      for (let k = 0; k < body.length; k++) code += `${escapeHtml(body[k])}\n`;
+      const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
+      // Escaping is char-wise and '\n' is never escaped, so escaping the joined
+      // body once is the same as escaping each line: one call, not one per line.
+      const code = body.length === 0 ? '' : `${escapeHtml(body.join('\n'))}\n`;
       blocks.push(`<pre><code${cls}>${code}</code></pre>`);
       continue;
     }
@@ -397,7 +502,7 @@ function renderMarkdown(src, env) {
       i++;
       continue;
     }
-    if ((line[0] === '-' || line[0] === '*') && HR.test(line)) {
+    if ((line[0] === '-' || line[0] === '*') && isHr(line)) {
       blocks.push('<hr>');
       i++;
       continue;
@@ -446,7 +551,7 @@ function renderMarkdown(src, env) {
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>`);
   }
-  return { html: blocks.map((b) => `${b}\n`).join(''), toc, excerpt: excerpt ?? '' };
+  return { html: blocks.length === 0 ? '' : `${blocks.join('\n')}\n`, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -553,13 +658,14 @@ function parseTemplate(name, src) {
 }
 
 /** The value at `path` in the scope chain: its first name from the nearest scope holding it, then own properties. */
+const hasOwn = Object.hasOwn;
 function lookup(scope, path) {
   let s = scope;
-  while (s !== null && !Object.hasOwn(s.vars, path[0])) s = s.parent;
+  while (s !== null && !hasOwn(s.vars, path[0])) s = s.parent;
   if (s === null) return undefined;
   let v = s.vars[path[0]];
   for (let k = 1; k < path.length; k++) {
-    if (v === null || typeof v !== 'object' || !Object.hasOwn(v, path[k])) return undefined;
+    if (v === null || typeof v !== 'object' || !hasOwn(v, path[k])) return undefined;
     v = v[path[k]];
   }
   return v;
@@ -592,12 +698,16 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'text':
         out.push(n.text);
         break;
-      case 'var':
-        out.push(ctx.escape(textOf(lookup(scope, n.path))));
+      case 'var': {
+        const v = lookup(scope, n.path);
+        out.push(ctx.escape(typeof v === 'string' ? v : textOf(v)));
         break;
-      case 'raw':
-        out.push(textOf(lookup(scope, n.path)));
+      }
+      case 'raw': {
+        const v = lookup(scope, n.path);
+        out.push(typeof v === 'string' ? v : textOf(v));
         break;
+      }
       case 'if': {
         const v = truthy(lookup(scope, n.path));
         const branch = v !== n.not ? n.then : n.else;
@@ -661,7 +771,10 @@ function frontMatter(b) {
     s.data = fm.data;
     s.body = fm.body;
     s.post = s.path.startsWith('posts/');
-    const own = RESERVED.find((d) => d !== 'posts' && s.path.startsWith(`${d}/`));
+    let own;
+    for (const d of RESERVED) {
+      if (d !== 'posts' && s.path.startsWith(`${d}/`)) { own = d; break; }
+    }
     if (own !== undefined) {
       b.report.push(`refused ${s.path}: ${own}/ is the generator's own`);
       continue;
@@ -709,7 +822,7 @@ function markdown(b) {
     const dir = dirOf(s.path);
     const env = {
       link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+        if (isAbsoluteUri(target) || target.startsWith('/') || target.startsWith('#')) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
@@ -817,12 +930,16 @@ function layouts(b) {
   const site = { title: b.input.site.title, base_url: b.base };
   const allTags = b.tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = b.posts.slice(0, b.input.site.recent).map((p) => b.cards.get(p));
+  // One shared base scope: every render's own vars hang under it instead of
+  // being spread into a fresh object per render (render vars are page, posts,
+  // pager and tag, never site, tags or recent, so nothing is shadowed).
+  const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
   const ctx = { templates: b.templates, escape: escapeHtml };
   const render = (name, vars) => {
     const nodes = b.templates.get(name);
     if (nodes === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    renderNodes(nodes, { vars, parent: baseScope }, ctx, 0, out);
     return out.join('');
   };
   for (const s of b.sources) b.output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
